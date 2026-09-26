@@ -35,6 +35,18 @@ def ensure():
                 created_at timestamptz NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS requeue_logs (
+                id serial PRIMARY KEY,
+                job_id integer NOT NULL REFERENCES jobs(id),
+                cyan_before double precision NOT NULL,
+                cyan_after double precision NOT NULL,
+                magenta_before double precision NOT NULL,
+                magenta_after double precision NOT NULL,
+                changed_by text NOT NULL,
+                changed_at timestamptz NOT NULL
+            )"""
+        )
         conn.commit()
 
 

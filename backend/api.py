@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS requeue_logs (
+    id serial PRIMARY KEY,
+    job_id integer NOT NULL REFERENCES jobs(id),
+    cyan_before double precision NOT NULL,
+    cyan_after double precision NOT NULL,
+    magenta_before double precision NOT NULL,
+    magenta_after double precision NOT NULL,
+    changed_by text NOT NULL,
+    changed_at timestamptz NOT NULL
+);
 """
 
 
@@ -45,6 +55,11 @@ class LoginIn(BaseModel):
 
 class JobIn(BaseModel):
     sheet: str
+    cyan_mm: float
+    magenta_mm: float
+
+
+class DeviationIn(BaseModel):
     cyan_mm: float
     magenta_mm: float
 
@@ -121,3 +136,56 @@ def enqueue(body: JobIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+@app.get("/api/jobs/{job_id}/requeue-logs")
+def requeue_logs(job_id: int, _user: dict = Depends(current_user)):
+    with connect() as conn:
+        job = conn.execute("SELECT 1 FROM jobs WHERE id = %s", (job_id,)).fetchone()
+        if job is None:
+            raise HTTPException(status_code=404, detail="待处理记录不存在")
+        return conn.execute(
+            """SELECT id, job_id, cyan_before, cyan_after, magenta_before, magenta_after,
+                      changed_by, changed_at
+               FROM requeue_logs WHERE job_id = %s ORDER BY id DESC""",
+            (job_id,),
+        ).fetchall()
+
+
+@app.patch("/api/jobs/{job_id}/deviation")
+def change_deviation(job_id: int, body: DeviationIn, user: dict = Depends(require_writer)):
+    # 待处理（pending）才可改偏差并重新排队；领取中（running）、已出结论（done）不可改。
+    with connect() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT cyan_mm, magenta_mm, status FROM jobs WHERE id = %s FOR UPDATE",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="待处理记录不存在")
+            if row["status"] != "pending":
+                raise HTTPException(status_code=409, detail="仅待处理记录可改偏差后重新排队")
+            now = datetime.now(timezone.utc)
+            log = conn.execute(
+                """INSERT INTO requeue_logs
+                   (job_id, cyan_before, cyan_after, magenta_before, magenta_after, changed_by, changed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id, cyan_before, cyan_after, magenta_before, magenta_after, changed_by, changed_at""",
+                (
+                    job_id,
+                    row["cyan_mm"],
+                    body.cyan_mm,
+                    row["magenta_mm"],
+                    body.magenta_mm,
+                    user["username"],
+                    now,
+                ),
+            ).fetchone()
+            updated = conn.execute(
+                """UPDATE jobs SET cyan_mm = %s, magenta_mm = %s
+                   WHERE id = %s
+                   RETURNING id, sheet, cyan_mm, magenta_mm, status, verdict""",
+                (body.cyan_mm, body.magenta_mm, job_id),
+            ).fetchone()
+        conn.commit()
+    return {"job": updated, "log": log}
