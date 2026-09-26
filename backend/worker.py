@@ -35,6 +35,19 @@ def ensure():
                 created_at timestamptz NOT NULL
             )"""
         )
+        conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS requeued_at timestamptz")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS requeue_logs (
+                id serial PRIMARY KEY,
+                job_id integer NOT NULL REFERENCES jobs (id),
+                old_cyan_mm double precision NOT NULL,
+                old_magenta_mm double precision NOT NULL,
+                new_cyan_mm double precision NOT NULL,
+                new_magenta_mm double precision NOT NULL,
+                changed_by text NOT NULL,
+                changed_at timestamptz NOT NULL
+            )"""
+        )
         conn.commit()
 
 
@@ -43,7 +56,7 @@ def claim_once(conn):
         """WITH picked AS (
              SELECT id FROM jobs
              WHERE status = 'pending'
-             ORDER BY id
+             ORDER BY COALESCE(requeued_at, created_at), id
              FOR UPDATE SKIP LOCKED
              LIMIT 1
            )

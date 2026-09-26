@@ -35,6 +35,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS requeued_at timestamptz;
+CREATE TABLE IF NOT EXISTS requeue_logs (
+    id serial PRIMARY KEY,
+    job_id integer NOT NULL REFERENCES jobs (id),
+    old_cyan_mm double precision NOT NULL,
+    old_magenta_mm double precision NOT NULL,
+    new_cyan_mm double precision NOT NULL,
+    new_magenta_mm double precision NOT NULL,
+    changed_by text NOT NULL,
+    changed_at timestamptz NOT NULL
+);
 """
 
 
@@ -45,6 +56,11 @@ class LoginIn(BaseModel):
 
 class JobIn(BaseModel):
     sheet: str
+    cyan_mm: float
+    magenta_mm: float
+
+
+class DeviationIn(BaseModel):
     cyan_mm: float
     magenta_mm: float
 
@@ -63,7 +79,7 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=403, detail="仅印刷员可送复核")
+        raise HTTPException(status_code=403, detail="仅印刷员可操作")
     return user
 
 
@@ -121,3 +137,61 @@ def enqueue(body: JobIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+@app.patch("/api/jobs/{job_id}/deviations")
+def change_deviations(job_id: int, body: DeviationIn, user: dict = Depends(require_writer)):
+    """待处理行可改青品偏差后重新排队；领取中/已出结论不可改。"""
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        with conn.transaction():
+            job = conn.execute(
+                "SELECT id, status, cyan_mm, magenta_mm FROM jobs WHERE id = %s FOR UPDATE",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise HTTPException(status_code=404, detail="找不到该印张")
+            if job["status"] == "running":
+                raise HTTPException(status_code=409, detail="领取中不可改偏差")
+            if job["status"] == "done":
+                raise HTTPException(status_code=409, detail="已出结论不可改偏差")
+            if job["status"] != "pending":
+                raise HTTPException(status_code=409, detail="仅待处理可改偏差")
+            conn.execute(
+                """INSERT INTO requeue_logs
+                   (job_id, old_cyan_mm, old_magenta_mm, new_cyan_mm, new_magenta_mm, changed_by, changed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    job_id,
+                    job["cyan_mm"],
+                    job["magenta_mm"],
+                    body.cyan_mm,
+                    body.magenta_mm,
+                    user["username"],
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """UPDATE jobs
+                   SET cyan_mm = %s, magenta_mm = %s, requeued_at = %s
+                   WHERE id = %s
+                   RETURNING id, sheet, cyan_mm, magenta_mm, status, verdict""",
+                (body.cyan_mm, body.magenta_mm, now, job_id),
+            ).fetchone()
+    return row
+
+
+@app.get("/api/requeue-logs")
+def list_requeue_logs(job_id: int | None = None, _user: dict = Depends(current_user)):
+    sql = (
+        "SELECT l.id, l.job_id, j.sheet, l.old_cyan_mm, l.old_magenta_mm, "
+        "l.new_cyan_mm, l.new_magenta_mm, l.changed_by, l.changed_at "
+        "FROM requeue_logs l JOIN jobs j ON j.id = l.job_id "
+    )
+    params = ()
+    if job_id is not None:
+        sql += "WHERE l.job_id = %s "
+        params = (job_id,)
+    sql += "ORDER BY l.id DESC"
+    with connect() as conn:
+        return conn.execute(sql, params).fetchall()
